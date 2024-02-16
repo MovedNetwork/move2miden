@@ -1,3 +1,4 @@
+mod cfg;
 mod compiler;
 mod move_utils;
 

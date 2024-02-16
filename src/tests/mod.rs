@@ -49,7 +49,9 @@ fn move_compile_arithmetic() -> anyhow::Result<Vec<u8>> {
         Flags::empty(),
         &known_attributes,
     );
-    let (_, result) = compiler.build().context("Failed to compile arithmetic.move")?;
+    let (_, result) = compiler
+        .build()
+        .context("Failed to compile arithmetic.move")?;
     let compiled_unit = result.unwrap().0.pop().unwrap().into_compiled_unit();
     let bytes = compiled_unit.serialize(None);
     Ok(bytes)

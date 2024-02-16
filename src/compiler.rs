@@ -1,4 +1,5 @@
 use {
+    crate::cfg::Cfg,
     miden_assembly::{
         ast::{CodeBody, Instruction, Node, ProcedureAst, ProgramAst, SourceLocation},
         ProcedureName,
@@ -74,6 +75,7 @@ fn compile_function(
         .function_signatures
         .get(code.locals.0 as usize)
         .ok_or_else(|| anyhow::Error::msg("Missing signature index"))?;
+    let _cfg = Cfg::new(&code.code); // TODO: use cfg to handle control flow
     let nodes = compile_body(&code.code, state)?;
     let body = CodeBody::new(nodes);
     let result = ProcedureAst {
