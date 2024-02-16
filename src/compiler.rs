@@ -10,6 +10,8 @@ use {
     },
 };
 
+const MAIN_NAME_REPLACEMENT: &str = "dummy_name_in_place_of_main";
+
 pub fn compile(module: &CompiledModule) -> anyhow::Result<ProgramAst> {
     let mut local_procs = Vec::new();
     let mut main_proc = None;
@@ -30,6 +32,12 @@ pub fn compile(module: &CompiledModule) -> anyhow::Result<ProgramAst> {
             }
             proc.name = ProcedureName::main();
             main_proc = Some(proc);
+            // Add a dummy placeholder for main, so the local procedure indices don't shift
+            local_procs.push(empty_proc(
+                MAIN_NAME_REPLACEMENT
+                    .try_into()
+                    .map_err(anyhow::Error::msg)?,
+            ));
         } else {
             local_procs.push(proc);
         }
@@ -60,16 +68,7 @@ fn compile_function(
         .map_err(|e| anyhow::anyhow!("Failed to parse function name: {e:?}"))?;
     let code = match &function.code {
         Some(code) => code,
-        None => {
-            return Ok(ProcedureAst {
-                name,
-                docs: None,
-                num_locals: 0,
-                body: CodeBody::new(Vec::new()),
-                start: SourceLocation::default(),
-                is_export: false,
-            })
-        }
+        None => return Ok(empty_proc(name)),
     };
     let _locals = state
         .function_signatures
@@ -93,6 +92,10 @@ fn compile_body(bytecode: &[Bytecode], state: &CompilerState) -> anyhow::Result<
     for c in bytecode {
         let node = match c {
             Bytecode::Add => Node::Instruction(Instruction::Add),
+            Bytecode::Sub => Node::Instruction(Instruction::Sub),
+            Bytecode::Mul => Node::Instruction(Instruction::Mul),
+            Bytecode::Div => Node::Instruction(Instruction::U32CheckedDiv),
+            Bytecode::Mod => Node::Instruction(Instruction::U32CheckedMod),
             Bytecode::LdU32(x) => Node::Instruction(Instruction::PushU32(*x)),
             Bytecode::LdU64(x) => {
                 let x = *x;
@@ -104,6 +107,7 @@ fn compile_body(bytecode: &[Bytecode], state: &CompilerState) -> anyhow::Result<
                 }
             }
             Bytecode::Eq => Node::Instruction(Instruction::Eq),
+            Bytecode::Pop => continue,
             Bytecode::MoveLoc(_) => continue, // TODO: properly handle locals
             Bytecode::Ret => continue,        // TODO: properly handle function return
             Bytecode::Abort => continue,      // TODO: properly handle aborts
@@ -115,7 +119,7 @@ fn compile_body(bytecode: &[Bytecode], state: &CompilerState) -> anyhow::Result<
                     .get(index.0 as usize)
                     .ok_or_else(|| anyhow::Error::msg("Missing function handle index"))?;
                 // TODO: use the name to figure out what to call.
-                Node::Instruction(Instruction::ExecLocal(0))
+                Node::Instruction(Instruction::ExecLocal(index.0))
             }
             // TODO: other bytecodes
             _ => anyhow::bail!("Unimplemented opcode {c:?}"),
@@ -123,4 +127,15 @@ fn compile_body(bytecode: &[Bytecode], state: &CompilerState) -> anyhow::Result<
         result.push(node);
     }
     Ok(result)
+}
+
+fn empty_proc(name: ProcedureName) -> ProcedureAst {
+    ProcedureAst {
+        name,
+        docs: None,
+        num_locals: 0,
+        body: CodeBody::new(Vec::new()),
+        start: SourceLocation::default(),
+        is_export: false,
+    }
 }

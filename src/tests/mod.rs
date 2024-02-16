@@ -11,8 +11,8 @@ use {
 };
 
 #[test]
-fn test_compile_add() {
-    let bytes = move_compile_add().unwrap();
+fn test_compile_arithmetic() {
+    let bytes = move_compile_arithmetic().unwrap();
     let move_module = move_utils::parse_module(&bytes).unwrap();
     let miden_ast = compiler::compile(&move_module).unwrap();
     let assembler = Assembler::default();
@@ -25,19 +25,19 @@ fn test_compile_add() {
     )
     .unwrap();
     let outputs = result.stack_outputs().stack();
-    // Outputs are 1, 1. First 1 comes from 2 + 3 == 5 equality check.
-    // Second 1 comes from the push 1 that is part of the abort flow.
-    // The second 1 will disappear once we properly handle control flow.
+    // Outputs are <assert_num>, 1. First 1 comes from 2 + 3 == 5 equality check.
+    // Second <assert_num> comes from the second assert param, that is part of the abort flow.
+    // The second number will disappear once we properly handle control flow.
     assert_eq!(
         outputs,
-        &[1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        &[5, 1, 4, 1, 3, 1, 2, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     );
 }
 
-fn move_compile_add() -> anyhow::Result<Vec<u8>> {
+fn move_compile_arithmetic() -> anyhow::Result<Vec<u8>> {
     let known_attributes = BTreeSet::new();
     let named_address_mapping = [(
-        "addition",
+        "arithmetic",
         NumericalAddress::new([0; 32], NumberFormat::Hex),
     )]
     .into_iter()
@@ -49,7 +49,7 @@ fn move_compile_add() -> anyhow::Result<Vec<u8>> {
         Flags::empty(),
         &known_attributes,
     );
-    let (_, result) = compiler.build().context("Failed to compile add.move")?;
+    let (_, result) = compiler.build().context("Failed to compile arithmetic.move")?;
     let compiled_unit = result.unwrap().0.pop().unwrap().into_compiled_unit();
     let bytes = compiled_unit.serialize(None);
     Ok(bytes)
