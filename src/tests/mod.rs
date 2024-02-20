@@ -25,12 +25,10 @@ fn test_compile_arithmetic() {
     )
     .unwrap();
     let outputs = result.stack_outputs().stack();
-    // Outputs are <assert_num>, 1. First 1 comes from 2 + 3 == 5 equality check.
-    // Second <assert_num> comes from the second assert param, that is part of the abort flow.
-    // The second number will disappear once we properly handle control flow.
+    // Outputs are 1s for each assertion.
     assert_eq!(
         outputs,
-        &[5, 1, 4, 1, 3, 1, 2, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        &[1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     );
 }
 

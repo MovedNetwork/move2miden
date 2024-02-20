@@ -11,7 +11,7 @@ use {
     },
 };
 
-const MAIN_NAME_REPLACEMENT: &str = "dummy_name_in_place_of_main";
+const MAIN_NAME_REPLACEMENT: &str = "dummy_name_in_place_of_main"; // TODO: remove after name mapping
 
 pub fn compile(module: &CompiledModule) -> anyhow::Result<ProgramAst> {
     let mut local_procs = Vec::new();
@@ -109,10 +109,10 @@ fn compile_body(bytecode: &[Bytecode], state: &CompilerState) -> anyhow::Result<
                 }
             }
             Bytecode::Eq => Node::Instruction(Instruction::Eq),
-            Bytecode::Pop => continue,
-            Bytecode::MoveLoc(_) => continue, // TODO: properly handle locals
-            Bytecode::Ret => continue,        // TODO: properly handle function return
-            Bytecode::Abort => continue,      // TODO: properly handle aborts
+            Bytecode::Pop => Node::Instruction(Instruction::Drop), // TODO: type validation
+            Bytecode::MoveLoc(_) => continue,                      // TODO: properly handle locals
+            Bytecode::Ret => continue, // TODO: properly handle function return
+            Bytecode::Abort => Node::Instruction(Instruction::Drop), // TODO: type validation, stack emptiness
             Bytecode::BrFalse(_) => continue, // TODO: properly handle control flow
             Bytecode::Branch(_) => continue,  // TODO: properly handle control flow
             Bytecode::Call(index) => {
