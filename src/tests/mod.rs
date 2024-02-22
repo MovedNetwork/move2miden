@@ -12,7 +12,7 @@ use {
 
 #[test]
 fn test_compile_arithmetic() {
-    let bytes = move_compile_arithmetic().unwrap();
+    let bytes = move_compile("arithmetic").unwrap();
     let move_module = move_utils::parse_module(&bytes).unwrap();
     let miden_ast = compiler::compile(&move_module).unwrap();
     let assembler = Assembler::default();
@@ -32,16 +32,23 @@ fn test_compile_arithmetic() {
     );
 }
 
-fn move_compile_arithmetic() -> anyhow::Result<Vec<u8>> {
+#[test]
+fn test_compile_loop() {
+    let bytes = move_compile("repeat").unwrap();
+    let move_module = move_utils::parse_module(&bytes).unwrap();
+    println!("{move_module:?}");
+}
+
+fn move_compile(package_name: &str) -> anyhow::Result<Vec<u8>> {
     let known_attributes = BTreeSet::new();
     let named_address_mapping = [(
-        "arithmetic",
+        package_name,
         NumericalAddress::new([0; 32], NumberFormat::Hex),
     )]
     .into_iter()
     .collect();
     let compiler = Compiler::from_files(
-        vec!["src/tests/res/move_sources"],
+        vec![format!("src/tests/res/move_sources/{package_name}.move")],
         Vec::new(),
         named_address_mapping,
         Flags::empty(),
@@ -49,7 +56,7 @@ fn move_compile_arithmetic() -> anyhow::Result<Vec<u8>> {
     );
     let (_, result) = compiler
         .build()
-        .context("Failed to compile arithmetic.move")?;
+        .context(format!("Failed to compile {package_name}.move"))?;
     let compiled_unit = result.unwrap().0.pop().unwrap().into_compiled_unit();
     let bytes = compiled_unit.serialize(None);
     Ok(bytes)

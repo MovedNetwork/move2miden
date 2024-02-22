@@ -2,7 +2,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     iter,
 };
 
@@ -78,9 +78,9 @@ impl Label {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Cfg<'a> {
-    blocks: HashMap<Label, Block<'a>>,
+    blocks: BTreeMap<Label, Block<'a>>,
     // Edges are directed as start -> end.
-    edges: HashMap<Label, BTreeSet<Label>>,
+    edges: BTreeMap<Label, BTreeSet<Label>>,
 }
 
 impl<'a> Cfg<'a> {
@@ -114,7 +114,7 @@ impl<'a> Cfg<'a> {
 
         // Collect points into an ordered list
         let branch_points: Vec<usize> = branch_dests.union(&branch_origins).copied().collect();
-        let blocks: HashMap<Label, Block<'a>> = branch_points
+        let blocks: BTreeMap<Label, Block<'a>> = branch_points
             .iter()
             .zip(branch_points.iter().skip(1))
             .filter_map(|(start, end)| {
@@ -128,7 +128,7 @@ impl<'a> Cfg<'a> {
             .chain(iter::once((Label::Exit, Block::new(&[]))))
             .collect();
 
-        let mut edges = HashMap::new();
+        let mut edges = BTreeMap::new();
         let mut current_label = None;
         for (i, b) in bytecode.iter().enumerate() {
             let maybe_label = Label::new(i);
@@ -211,7 +211,7 @@ impl<'a> Cfg<'a> {
     }
 }
 
-fn insert_edge(edges: &mut HashMap<Label, BTreeSet<Label>>, start: Label, end: Label) {
+fn insert_edge(edges: &mut BTreeMap<Label, BTreeSet<Label>>, start: Label, end: Label) {
     let xs = edges.entry(start).or_default();
     xs.insert(end);
 }
@@ -220,7 +220,7 @@ fn insert_edge(edges: &mut HashMap<Label, BTreeSet<Label>>, start: Label, end: L
 // from the bytecode at the given index.
 fn resolve_destinations<'a>(
     bytecode: &'a [Bytecode],
-    blocks: &HashMap<Label, Block<'a>>,
+    blocks: &BTreeMap<Label, Block<'a>>,
     index: usize,
 ) -> Vec<Label> {
     let mut result = Vec::new();
@@ -264,42 +264,244 @@ fn resolve_destinations<'a>(
     result
 }
 
-#[test]
-fn test_simple_cfg() {
-    let bytecode = vec![
-        Bytecode::LdU32(0),
-        Bytecode::LdU32(0),
-        Bytecode::LdU32(0),
-        Bytecode::LdU32(0),
-        Bytecode::LdU32(0),
-        Bytecode::BrFalse(7),
-        Bytecode::Branch(9),
-        Bytecode::LdU32(0),
-        Bytecode::Abort,
-        Bytecode::Ret,
-    ];
-    let cfg = Cfg::new(&bytecode);
-    let expected_blocks = [
-        (Label::Entry, Block::new(&bytecode[0..5])),
-        (Label::Point(7), Block::new(&bytecode[7..9])),
-        (Label::Point(9), Block::new(&bytecode[9..])),
-        (Label::Exit, Block::new(&[])),
-    ]
-    .into_iter()
-    .collect();
-    let expected_edges = [
-        (
-            Label::Entry,
-            [Label::Point(7), Label::Point(9)].into_iter().collect(),
-        ),
-        (Label::Point(7), [Label::Exit].into_iter().collect()),
-        (Label::Point(9), [Label::Exit].into_iter().collect()),
-    ]
-    .into_iter()
-    .collect();
-    let expected = Cfg {
-        blocks: expected_blocks,
-        edges: expected_edges,
-    };
-    assert_eq!(cfg, expected);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_trivial_cfg() {
+        let bytecode = vec![
+            Bytecode::LdU32(0),
+            Bytecode::LdU32(1),
+            Bytecode::LdU32(2),
+            Bytecode::LdU32(3),
+            Bytecode::LdU32(4),
+            Bytecode::LdU32(5),
+        ];
+        let cfg = Cfg::new(&bytecode);
+        let expected = build_expected_cfg(
+            [(Label::Entry, bytecode.as_slice()), (Label::Exit, &[])],
+            [(Label::Entry, &[Label::Exit])],
+        );
+        assert_eq!(cfg, expected);
+    }
+
+    #[test]
+    fn test_simple_cfg() {
+        let bytecode = vec![
+            Bytecode::LdU32(0),
+            Bytecode::LdU32(0),
+            Bytecode::LdU32(0),
+            Bytecode::LdU32(0),
+            Bytecode::LdU32(0),
+            Bytecode::BrFalse(7),
+            Bytecode::Branch(9),
+            Bytecode::LdU32(0),
+            Bytecode::Abort,
+            Bytecode::Ret,
+        ];
+        let cfg = Cfg::new(&bytecode);
+        let expected = build_expected_cfg(
+            [
+                (Label::Entry, &bytecode[0..5]),
+                (Label::Point(7), &bytecode[7..9]),
+                (Label::Point(9), &bytecode[9..]),
+                (Label::Exit, &[]),
+            ],
+            [
+                (Label::Entry, [Label::Point(7), Label::Point(9)].as_slice()),
+                (Label::Point(7), &[Label::Exit]),
+                (Label::Point(9), &[Label::Exit]),
+            ],
+        );
+        assert_eq!(cfg, expected);
+    }
+
+    #[test]
+    fn test_while_loop_cfg() {
+        let bytecode = vec![
+            Bytecode::LdU32(1),
+            Bytecode::StLoc(1),
+            Bytecode::LdU32(0),
+            Bytecode::StLoc(2),
+            Bytecode::CopyLoc(1),
+            Bytecode::CopyLoc(0),
+            Bytecode::Le,
+            Bytecode::BrFalse(18),
+            Bytecode::Branch(9),
+            Bytecode::MoveLoc(2),
+            Bytecode::CopyLoc(1),
+            Bytecode::Add,
+            Bytecode::StLoc(2),
+            Bytecode::MoveLoc(1),
+            Bytecode::LdU32(1),
+            Bytecode::Add,
+            Bytecode::StLoc(1),
+            Bytecode::Branch(4),
+            Bytecode::MoveLoc(2),
+            Bytecode::Ret,
+        ];
+        let cfg = Cfg::new(&bytecode);
+        let expected = build_expected_cfg(
+            [
+                (Label::Entry, &bytecode[0..4]),
+                (Label::Point(4), &bytecode[4..7]),
+                (Label::Point(9), &bytecode[9..17]),
+                (Label::Point(18), &bytecode[18..20]),
+                (Label::Exit, &[]),
+            ],
+            [
+                (Label::Entry, [Label::Point(4)].as_slice()),
+                (Label::Point(4), &[Label::Point(9), Label::Point(18)]),
+                (Label::Point(9), &[Label::Point(4)]),
+                (Label::Point(18), &[Label::Exit]),
+            ],
+        );
+        assert_eq!(cfg, expected);
+    }
+
+    #[test]
+    fn test_break_loop() {
+        let bytecode = vec![
+            Bytecode::LdU32(0), // Label::Entry
+            Bytecode::StLoc(1),
+            Bytecode::LdU32(1),
+            Bytecode::StLoc(2),
+            Bytecode::CopyLoc(0),
+            Bytecode::LdU32(0),
+            Bytecode::Eq,
+            Bytecode::BrFalse(10), // Label::Point(7)
+            Bytecode::MoveLoc(1),
+            Bytecode::Ret,
+            Bytecode::CopyLoc(0), // Label::Point(10)
+            Bytecode::LdU32(1),
+            Bytecode::Eq,
+            Bytecode::BrFalse(16), // Label::Point(13)
+            Bytecode::MoveLoc(2),
+            Bytecode::Ret,
+            Bytecode::MoveLoc(1), // Label::Point(16)
+            Bytecode::CopyLoc(2),
+            Bytecode::Add,
+            Bytecode::StLoc(3),
+            Bytecode::MoveLoc(2),
+            Bytecode::StLoc(1),
+            Bytecode::MoveLoc(3),
+            Bytecode::StLoc(2),
+            Bytecode::CopyLoc(0),
+            Bytecode::LdU32(1),
+            Bytecode::Eq,
+            Bytecode::BrFalse(29), // Label::Point(27)
+            Bytecode::Branch(34),
+            Bytecode::MoveLoc(0), // Label::Point(29)
+            Bytecode::LdU32(1),
+            Bytecode::Sub,
+            Bytecode::StLoc(0),
+            Bytecode::Branch(16), // Label::Point(33)
+            Bytecode::MoveLoc(2), // Label::Point(34)
+            Bytecode::Ret,
+        ];
+        let cfg = Cfg::new(&bytecode);
+        let expected = build_expected_cfg(
+            [
+                (Label::Entry, &bytecode[0..7]),
+                (Label::Point(8), &bytecode[8..10]),
+                (Label::Point(10), &bytecode[10..13]),
+                (Label::Point(14), &bytecode[14..16]),
+                (Label::Point(16), &bytecode[16..27]),
+                (Label::Point(29), &bytecode[29..33]),
+                (Label::Point(34), &bytecode[34..36]),
+                (Label::Exit, &[]),
+            ],
+            [
+                (Label::Entry, [Label::Point(8), Label::Point(10)].as_slice()),
+                (Label::Point(8), &[Label::Exit]),
+                (Label::Point(10), &[Label::Point(14), Label::Point(16)]),
+                (Label::Point(14), &[Label::Exit]),
+                (Label::Point(16), &[Label::Point(29), Label::Point(34)]),
+                (Label::Point(29), &[Label::Point(16)]),
+                (Label::Point(34), &[Label::Exit]),
+            ],
+        );
+        assert_eq!(cfg, expected);
+    }
+
+    #[test]
+    fn test_while_loop_with_if_in_body() {
+        let bytecode = vec![
+            Bytecode::LdU32(0), // Label::Entry
+            Bytecode::StLoc(1),
+            Bytecode::CopyLoc(0),
+            Bytecode::LdU32(1),
+            Bytecode::Neq,
+            Bytecode::BrFalse(29), // Label::Point(5)
+            Bytecode::Branch(7),
+            Bytecode::CopyLoc(0), // Label::Point(7)
+            Bytecode::LdU32(2),
+            Bytecode::Mod,
+            Bytecode::LdU32(0),
+            Bytecode::Eq,
+            Bytecode::BrFalse(18), // Label::Point(12)
+            Bytecode::MoveLoc(0),
+            Bytecode::LdU32(2),
+            Bytecode::Div,
+            Bytecode::StLoc(0),
+            Bytecode::Branch(24), // Label::Point(17)
+            Bytecode::LdU32(3),
+            Bytecode::MoveLoc(0),
+            Bytecode::Mul,
+            Bytecode::LdU32(1),
+            Bytecode::Add,
+            Bytecode::StLoc(0),
+            Bytecode::MoveLoc(1), // Label::Point(24)
+            Bytecode::LdU32(1),
+            Bytecode::Add,
+            Bytecode::StLoc(1),
+            Bytecode::Branch(2), // Label::Point(28)
+            Bytecode::MoveLoc(1),
+            Bytecode::Ret,
+        ];
+        let cfg = Cfg::new(&bytecode);
+        let expected = build_expected_cfg(
+            [
+                (Label::Entry, &bytecode[0..2]),
+                (Label::Point(2), &bytecode[2..5]),
+                (Label::Point(7), &bytecode[7..12]),
+                (Label::Point(13), &bytecode[13..17]),
+                (Label::Point(18), &bytecode[18..24]),
+                (Label::Point(24), &bytecode[24..28]),
+                (Label::Point(29), &bytecode[29..31]),
+                (Label::Exit, &[]),
+            ],
+            [
+                (Label::Entry, [Label::Point(2)].as_slice()),
+                (Label::Point(2), &[Label::Point(7), Label::Point(29)]),
+                (Label::Point(7), &[Label::Point(13), Label::Point(18)]),
+                (Label::Point(13), &[Label::Point(24)]),
+                (Label::Point(18), &[Label::Point(24)]),
+                (Label::Point(24), &[Label::Point(2)]),
+                (Label::Point(29), &[Label::Exit]),
+            ],
+        );
+        assert_eq!(cfg, expected);
+    }
+
+    fn build_expected_cfg<'a, 'b, B, E, T>(blocks: B, edges: E) -> Cfg<'a>
+    where
+        B: IntoIterator<Item = (Label, &'a [Bytecode])>,
+        E: IntoIterator<Item = (Label, T)>,
+        T: IntoIterator<Item = &'b Label>,
+    {
+        let expected_blocks = blocks
+            .into_iter()
+            .map(|(l, code)| (l, Block::new(code)))
+            .collect();
+        let expected_edges = edges
+            .into_iter()
+            .map(|(l, ls)| (l, ls.into_iter().copied().collect()))
+            .collect();
+        Cfg {
+            blocks: expected_blocks,
+            edges: expected_edges,
+        }
+    }
 }
