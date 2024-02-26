@@ -1,12 +1,13 @@
 use {
     crate::cfg::Cfg,
+    anyhow::Error,
     miden_assembly::{
         ast::{CodeBody, Instruction, Node, ProcedureAst, ProgramAst, SourceLocation},
         ProcedureName,
     },
     move_binary_format::{
         access::ModuleAccess,
-        file_format::{Bytecode, FunctionDefinition, Signature},
+        file_format::{Bytecode, Constant, FunctionDefinition, FunctionDefinitionIndex, Signature},
         CompiledModule,
     },
 };
@@ -17,14 +18,22 @@ pub fn compile(module: &CompiledModule) -> anyhow::Result<ProgramAst> {
     let mut local_procs = Vec::new();
     let mut main_proc = None;
     let mut state = CompilerState::default();
-    for handle in module.function_handles() {
-        let name_index = handle.name;
-        let name = module.identifier_at(name_index);
-        state.function_names.push(name.to_string())
+    // Build up function details for compiler state
+    for (index, handle) in module.function_handles().iter().enumerate() {
+        let name = module.identifier_at(handle.name).to_string();
+        let params = module.signature_at(handle.parameters).to_owned();
+        let func_def = module.function_def_at(FunctionDefinitionIndex::new(index as u16));
+        let locals = match &func_def.code {
+            Some(code) => module.signature_at(code.locals).to_owned(),
+            None => Signature::default(),
+        };
+        state.functions.push(Function {
+            name,
+            params,
+            locals,
+        });
     }
-    for signature in module.signatures() {
-        state.function_signatures.push(signature.clone());
-    }
+    state.constants = module.constant_pool.to_owned();
     for function in module.function_defs() {
         let mut proc = compile_function(function, &state)?;
         if function.is_entry {
@@ -34,52 +43,49 @@ pub fn compile(module: &CompiledModule) -> anyhow::Result<ProgramAst> {
             proc.name = ProcedureName::main();
             main_proc = Some(proc);
             // Add a dummy placeholder for main, so the local procedure indices don't shift
-            local_procs.push(empty_proc(
-                MAIN_NAME_REPLACEMENT
-                    .try_into()
-                    .map_err(anyhow::Error::msg)?,
-            ));
+            local_procs.push(empty_proc(MAIN_NAME_REPLACEMENT.into())?);
         } else {
             local_procs.push(proc);
         }
     }
-    let main_proc = main_proc.ok_or_else(|| anyhow::Error::msg("No entry point defined"))?;
+    let main_proc = main_proc.ok_or_else(|| Error::msg("No entry point defined"))?;
     let result = ProgramAst::new(main_proc.body.nodes().to_vec(), local_procs)?;
     Ok(result)
+}
+
+/// Struct definition of a module function.
+#[derive(Debug, Default)]
+struct Function {
+    name: String,
+    params: Signature,
+    locals: Signature,
 }
 
 /// Struct carrying extra information needed during compilation.
 #[derive(Debug, Default)]
 struct CompilerState {
-    function_names: Vec<String>,
-    function_signatures: Vec<Signature>,
+    constants: Vec<Constant>,
+    functions: Vec<Function>,
 }
 
 fn compile_function(
-    function: &FunctionDefinition,
+    func_def: &FunctionDefinition,
     state: &CompilerState,
 ) -> anyhow::Result<ProcedureAst> {
-    let name = state
-        .function_names
-        .get(function.function.0 as usize)
-        .ok_or_else(|| anyhow::Error::msg("Missing function handle index"))?;
-    let name = name
-        .as_str()
-        .try_into()
-        .map_err(|e| anyhow::anyhow!("Failed to parse function name: {e:?}"))?;
-    let code = match &function.code {
+    let function = state
+        .functions
+        .get(func_def.function.0 as usize)
+        .ok_or_else(|| Error::msg("Missing function handle index"))?;
+    let code = match &func_def.code {
         Some(code) => code,
-        None => return Ok(empty_proc(name)),
+        None => return empty_proc(function.name.clone()),
     };
-    let _locals = state
-        .function_signatures
-        .get(code.locals.0 as usize)
-        .ok_or_else(|| anyhow::Error::msg("Missing signature index"))?;
+    let _locals = &function.locals;
     let _cfg = Cfg::new(&code.code); // TODO: use cfg to handle control flow
     let nodes = compile_body(&code.code, state)?;
     let body = CodeBody::new(nodes);
     let result = ProcedureAst {
-        name,
+        name: function.name.as_str().try_into().map_err(Error::msg)?,
         docs: None,
         num_locals: 0, // TODO: use `locals` from function definition
         body,
@@ -116,10 +122,11 @@ fn compile_body(bytecode: &[Bytecode], state: &CompilerState) -> anyhow::Result<
             Bytecode::BrFalse(_) => continue, // TODO: properly handle control flow
             Bytecode::Branch(_) => continue,  // TODO: properly handle control flow
             Bytecode::Call(index) => {
-                let _name = state
-                    .function_names
+                let _name = &state
+                    .functions
                     .get(index.0 as usize)
-                    .ok_or_else(|| anyhow::Error::msg("Missing function handle index"))?;
+                    .ok_or_else(|| Error::msg("Missing function handle index"))?
+                    .name;
                 // TODO: use the name to figure out what to call.
                 Node::Instruction(Instruction::ExecLocal(index.0))
             }
@@ -131,13 +138,17 @@ fn compile_body(bytecode: &[Bytecode], state: &CompilerState) -> anyhow::Result<
     Ok(result)
 }
 
-fn empty_proc(name: ProcedureName) -> ProcedureAst {
-    ProcedureAst {
+fn empty_proc(name: String) -> anyhow::Result<ProcedureAst> {
+    let name = name
+        .as_str()
+        .try_into()
+        .map_err(|e| anyhow::anyhow!("Failed to parse function name: {e:?}"))?;
+    Ok(ProcedureAst {
         name,
         docs: None,
         num_locals: 0,
         body: CodeBody::new(Vec::new()),
         start: SourceLocation::default(),
         is_export: false,
-    }
+    })
 }
