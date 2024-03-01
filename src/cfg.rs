@@ -3,7 +3,7 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
-    iter,
+    fmt, iter,
 };
 
 use move_binary_format::file_format::Bytecode;
@@ -76,15 +76,28 @@ impl Label {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutgoingEdge {
+    If { true_case: Label, false_case: Label },
+    Pass { next: Label },
+    LoopBack { header: Label },
+    WhileTrue { body_start: Label, after: Label },
+    // Miden does not have while false, but it is
+    // possible in Move because the loop structure is less restrictive.
+    // We will convert to `WhileTrue` by adding an extra `Not` instruction
+    // during the compilation step.
+    WhileFalse { body_start: Label, after: Label },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Cfg<'a> {
     blocks: BTreeMap<Label, Block<'a>>,
     // Edges are directed as start -> end.
-    edges: BTreeMap<Label, BTreeSet<Label>>,
+    edges: BTreeMap<Label, OutgoingEdge>,
 }
 
 impl<'a> Cfg<'a> {
-    pub fn new(bytecode: &'a [Bytecode]) -> Self {
+    pub fn new(bytecode: &'a [Bytecode]) -> Result<Self, CfgError> {
         // Locations that are destinations of a branch.
         let mut branch_dests = BTreeSet::new();
         branch_dests.insert(0); // 0 is the entry point of the function
@@ -97,6 +110,7 @@ impl<'a> Cfg<'a> {
             match b {
                 Bytecode::BrTrue(x) | Bytecode::BrFalse(x) => {
                     let x = *x as usize;
+                    validate_conditional_jump(x, i, bytecode)?;
                     branch_origins.insert(i);
                     // Both x and i + 1 are branch destinations because we jump to x
                     // if the condition is met and simply go to the next bytecode otherwise.
@@ -105,6 +119,7 @@ impl<'a> Cfg<'a> {
                 }
                 Bytecode::Branch(x) => {
                     let x = *x as usize;
+                    validate_unconditional_jump(x, i, bytecode)?;
                     branch_origins.insert(i);
                     branch_dests.insert(x);
                 }
@@ -137,65 +152,95 @@ impl<'a> Cfg<'a> {
                 // If we were already in a block then that
                 // block transition to the new one.
                 if let Some(l) = current_label {
-                    insert_edge(&mut edges, l, maybe_label);
+                    edges.insert(l, OutgoingEdge::Pass { next: maybe_label });
                 }
                 current_label = Some(maybe_label);
             }
+            let l = match current_label {
+                Some(l) => l,
+                None => continue,
+            };
             match b {
-                Bytecode::BrTrue(x) | Bytecode::BrFalse(x) => {
+                Bytecode::BrTrue(x) => {
                     let x = *x as usize;
-                    let dest_label = Label::new(x);
-                    if blocks.contains_key(&dest_label) {
-                        if let Some(l) = current_label {
-                            insert_edge(&mut edges, l, dest_label);
-                        }
-                    } else {
-                        // This can only happen if the destination
-                        // is another branch instruction.
-                        // In this case we need to check the transitions of that
-                        // instruction.
-                        let dests = resolve_destinations(bytecode, &blocks, x);
-                        if let Some(l) = current_label {
-                            for dest_label in dests {
-                                insert_edge(&mut edges, l, dest_label);
-                            }
-                        }
-                    }
-
-                    // No need to worry about the i + 1 destination,
-                    // it will be handled by the next iteration of the
-                    // loop because we keep `current_label`.
+                    let true_case = Label::new(x);
+                    let false_case = match bytecode.get(i + 1) {
+                        Some(Bytecode::Branch(x)) => Label::new(*x as usize),
+                        _ => Label::new(i + 1),
+                    };
+                    edges.insert(
+                        l,
+                        OutgoingEdge::If {
+                            true_case,
+                            false_case,
+                        },
+                    );
+                    current_label = None;
+                }
+                Bytecode::BrFalse(x) => {
+                    let x = *x as usize;
+                    let false_case = Label::new(x);
+                    let true_case = match bytecode.get(i + 1) {
+                        Some(Bytecode::Branch(x)) => Label::new(*x as usize),
+                        _ => Label::new(i + 1),
+                    };
+                    edges.insert(
+                        l,
+                        OutgoingEdge::If {
+                            true_case,
+                            false_case,
+                        },
+                    );
+                    current_label = None;
                 }
                 Bytecode::Branch(x) => {
                     let x = *x as usize;
                     let dest_label = Label::new(x);
-                    if blocks.contains_key(&dest_label) {
-                        if let Some(l) = current_label {
-                            insert_edge(&mut edges, l, dest_label);
-                        }
-                    } else {
-                        // This can only happen if the destination
-                        // is another branch instruction.
-                        // In this case we need to check the transitions of that
-                        // instruction.
-                        let dests = resolve_destinations(bytecode, &blocks, x);
-                        if let Some(l) = current_label {
-                            for dest_label in dests {
-                                insert_edge(&mut edges, l, dest_label);
+                    let edge = if x < i {
+                        // In the loop-back case we convert the if-else into a while loop
+                        let Some(OutgoingEdge::If {
+                            true_case,
+                            false_case,
+                        }) = edges.remove(&dest_label)
+                        else {
+                            return Err(CfgError::InvalidLoopHeader);
+                        };
+                        // Need to figure out if the true case or false case is the
+                        // body of the loop. The body is the path which leads to
+                        // the current label (since it is branching back up to the header).
+                        match (
+                            has_path(&edges, &true_case, &l),
+                            has_path(&edges, &false_case, &l),
+                        ) {
+                            // Exactly one path should get to this node; if none or both do then there is a problem
+                            (true, true) | (false, false) => {
+                                return Err(CfgError::InvalidLoopHeader)
                             }
-                        }
-                    }
-
-                    // Set current label to none because we have
-                    // jumped out of the current block.
+                            (true, false) => edges.insert(
+                                dest_label,
+                                OutgoingEdge::WhileTrue {
+                                    body_start: true_case,
+                                    after: false_case,
+                                },
+                            ),
+                            (false, true) => edges.insert(
+                                dest_label,
+                                OutgoingEdge::WhileFalse {
+                                    body_start: false_case,
+                                    after: true_case,
+                                },
+                            ),
+                        };
+                        OutgoingEdge::LoopBack { header: dest_label }
+                    } else {
+                        OutgoingEdge::Pass { next: dest_label }
+                    };
+                    edges.insert(l, edge);
                     current_label = None;
                 }
                 Bytecode::Abort | Bytecode::Ret => {
                     // Abort and Ret signify the end of the function
-                    if let Some(l) = current_label {
-                        let dest_label = Label::Exit;
-                        insert_edge(&mut edges, l, dest_label);
-                    }
+                    edges.insert(l, OutgoingEdge::Pass { next: Label::Exit });
                     current_label = None;
                 }
                 _ => continue,
@@ -203,65 +248,126 @@ impl<'a> Cfg<'a> {
         }
         // The last block exits the function
         if let Some(l) = current_label {
-            let dest_label = Label::Exit;
-            insert_edge(&mut edges, l, dest_label);
+            edges.insert(l, OutgoingEdge::Pass { next: Label::Exit });
         }
 
-        Self { blocks, edges }
+        Ok(Self { blocks, edges })
     }
 }
 
-fn insert_edge(edges: &mut BTreeMap<Label, BTreeSet<Label>>, start: Label, end: Label) {
-    let xs = edges.entry(start).or_default();
-    xs.insert(end);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CfgError {
+    // BrTrue, BrFalse and Branch are not allowed to jump to another such instruction.
+    BranchToBranch,
+    // BrTrue and BrFalse are not allowed to jump to an earlier index in the bytecode.
+    ConditionalJumpBack,
+    // BrTrue, BrFalse and Branch must branch to a value in [0, bytecode.len() - 1].
+    BranchOutOfBounds,
+    // BrTrue, BrFalse and Branch cannot target itself as the jump point.
+    SelfBranch,
+    // It is not allowed to have multiple BrTrue/BrFalse in a row.
+    RepeatConditionalBranch,
+    // This error is returned if we try to set and edge when not in a block
+    UnexpectedBlockEnd,
+    // Loop headers are expected to have two branch options: loop body or post-loop code
+    InvalidLoopHeader,
 }
 
-// Figure out what nodes of the CFG could be visited
-// from the bytecode at the given index.
-fn resolve_destinations<'a>(
-    bytecode: &'a [Bytecode],
-    blocks: &BTreeMap<Label, Block<'a>>,
+impl fmt::Display for CfgError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl std::error::Error for CfgError {}
+
+fn validate_conditional_jump(
+    dest: usize,
     index: usize,
-) -> Vec<Label> {
-    let mut result = Vec::new();
-    let mut to_visit = VecDeque::new();
-    let mut visited = HashSet::new();
-    to_visit.push_back(index);
-    while let Some(index) = to_visit.pop_front() {
-        visited.insert(index);
-        match &bytecode[index] {
-            Bytecode::BrTrue(x) | Bytecode::BrFalse(x) => {
-                let x = *x as usize;
-                let dest_label = Label::new(x);
-                if blocks.contains_key(&dest_label) {
-                    result.push(dest_label);
-                } else if !visited.contains(&x) {
-                    to_visit.push_back(x);
+    bytecode: &[Bytecode],
+) -> Result<(), CfgError> {
+    if dest < index {
+        return Err(CfgError::ConditionalJumpBack);
+    }
+    if bytecode
+        .get(index + 1)
+        .filter(|b| Bytecode::is_conditional_branch(b))
+        .is_some()
+    {
+        return Err(CfgError::RepeatConditionalBranch);
+    }
+    validate_unconditional_jump(dest, index, bytecode)
+}
+
+fn validate_unconditional_jump(
+    dest: usize,
+    index: usize,
+    bytecode: &[Bytecode],
+) -> Result<(), CfgError> {
+    if dest == index {
+        return Err(CfgError::SelfBranch);
+    }
+    let dest_code = bytecode.get(dest).ok_or(CfgError::BranchOutOfBounds)?;
+    match dest_code {
+        Bytecode::BrTrue(_) | Bytecode::BrFalse(_) | Bytecode::Branch(_) => {
+            Err(CfgError::BranchToBranch)
+        }
+        _ => Ok(()),
+    }
+}
+
+// Use BFS to see if there is a path from `start` to `target` using `edges`
+fn has_path(edges: &BTreeMap<Label, OutgoingEdge>, start: &Label, target: &Label) -> bool {
+    let mut visited = BTreeSet::new();
+    let mut queue = VecDeque::new();
+    queue.push_back(start);
+    while let Some(label) = queue.pop_front() {
+        visited.insert(label);
+        if label == target {
+            return true;
+        }
+        match edges.get(label) {
+            Some(OutgoingEdge::If {
+                true_case,
+                false_case,
+            }) => {
+                if !visited.contains(true_case) {
+                    queue.push_back(true_case);
                 }
-                // Can visit the next index too if the condition fails
-                let x = index + 1;
-                if !visited.contains(&x) {
-                    to_visit.push_back(x);
+                if !visited.contains(false_case) {
+                    queue.push_back(false_case);
                 }
             }
-            Bytecode::Branch(x) => {
-                let x = *x as usize;
-                let dest_label = Label::new(x);
-                if blocks.contains_key(&dest_label) {
-                    result.push(dest_label);
-                } else if !visited.contains(&x) {
-                    to_visit.push_back(x);
+            Some(OutgoingEdge::LoopBack { header }) => {
+                if !visited.contains(header) {
+                    queue.push_back(header);
                 }
             }
-            _ => {
-                let dest_label = Label::new(index);
-                if blocks.contains_key(&dest_label) {
-                    result.push(dest_label);
+            Some(OutgoingEdge::Pass { next }) => {
+                if !visited.contains(next) {
+                    queue.push_back(next);
                 }
             }
+            Some(OutgoingEdge::WhileTrue { body_start, after }) => {
+                if !visited.contains(body_start) {
+                    queue.push_back(body_start);
+                }
+                if !visited.contains(after) {
+                    queue.push_back(after);
+                }
+            }
+            Some(OutgoingEdge::WhileFalse { body_start, after }) => {
+                if !visited.contains(body_start) {
+                    queue.push_back(body_start);
+                }
+                if !visited.contains(after) {
+                    queue.push_back(after);
+                }
+            }
+            None => (),
         }
     }
-    result
+    false
 }
 
 #[cfg(test)]
@@ -278,10 +384,10 @@ mod tests {
             Bytecode::LdU32(4),
             Bytecode::LdU32(5),
         ];
-        let cfg = Cfg::new(&bytecode);
+        let cfg = Cfg::new(&bytecode).unwrap();
         let expected = build_expected_cfg(
             [(Label::Entry, bytecode.as_slice()), (Label::Exit, &[])],
-            [(Label::Entry, &[Label::Exit])],
+            [(Label::Entry, OutgoingEdge::Pass { next: Label::Exit })],
         );
         assert_eq!(cfg, expected);
     }
@@ -300,7 +406,7 @@ mod tests {
             Bytecode::Abort,
             Bytecode::Ret,
         ];
-        let cfg = Cfg::new(&bytecode);
+        let cfg = Cfg::new(&bytecode).unwrap();
         let expected = build_expected_cfg(
             [
                 (Label::Entry, &bytecode[0..5]),
@@ -309,9 +415,15 @@ mod tests {
                 (Label::Exit, &[]),
             ],
             [
-                (Label::Entry, [Label::Point(7), Label::Point(9)].as_slice()),
-                (Label::Point(7), &[Label::Exit]),
-                (Label::Point(9), &[Label::Exit]),
+                (
+                    Label::Entry,
+                    OutgoingEdge::If {
+                        true_case: Label::Point(9),
+                        false_case: Label::Point(7),
+                    },
+                ),
+                (Label::Point(7), OutgoingEdge::Pass { next: Label::Exit }),
+                (Label::Point(9), OutgoingEdge::Pass { next: Label::Exit }),
             ],
         );
         assert_eq!(cfg, expected);
@@ -341,7 +453,7 @@ mod tests {
             Bytecode::MoveLoc(2),
             Bytecode::Ret,
         ];
-        let cfg = Cfg::new(&bytecode);
+        let cfg = Cfg::new(&bytecode).unwrap();
         let expected = build_expected_cfg(
             [
                 (Label::Entry, &bytecode[0..4]),
@@ -351,10 +463,26 @@ mod tests {
                 (Label::Exit, &[]),
             ],
             [
-                (Label::Entry, [Label::Point(4)].as_slice()),
-                (Label::Point(4), &[Label::Point(9), Label::Point(18)]),
-                (Label::Point(9), &[Label::Point(4)]),
-                (Label::Point(18), &[Label::Exit]),
+                (
+                    Label::Entry,
+                    OutgoingEdge::Pass {
+                        next: Label::Point(4),
+                    },
+                ),
+                (
+                    Label::Point(4),
+                    OutgoingEdge::WhileTrue {
+                        body_start: Label::Point(9),
+                        after: Label::Point(18),
+                    },
+                ),
+                (
+                    Label::Point(9),
+                    OutgoingEdge::LoopBack {
+                        header: Label::Point(4),
+                    },
+                ),
+                (Label::Point(18), OutgoingEdge::Pass { next: Label::Exit }),
             ],
         );
         assert_eq!(cfg, expected);
@@ -400,7 +528,7 @@ mod tests {
             Bytecode::MoveLoc(2), // Label::Point(34)
             Bytecode::Ret,
         ];
-        let cfg = Cfg::new(&bytecode);
+        let cfg = Cfg::new(&bytecode).unwrap();
         let expected = build_expected_cfg(
             [
                 (Label::Entry, &bytecode[0..7]),
@@ -413,13 +541,36 @@ mod tests {
                 (Label::Exit, &[]),
             ],
             [
-                (Label::Entry, [Label::Point(8), Label::Point(10)].as_slice()),
-                (Label::Point(8), &[Label::Exit]),
-                (Label::Point(10), &[Label::Point(14), Label::Point(16)]),
-                (Label::Point(14), &[Label::Exit]),
-                (Label::Point(16), &[Label::Point(29), Label::Point(34)]),
-                (Label::Point(29), &[Label::Point(16)]),
-                (Label::Point(34), &[Label::Exit]),
+                (
+                    Label::Entry,
+                    OutgoingEdge::If {
+                        true_case: Label::Point(8),
+                        false_case: Label::Point(10),
+                    },
+                ),
+                (Label::Point(8), OutgoingEdge::Pass { next: Label::Exit }),
+                (
+                    Label::Point(10),
+                    OutgoingEdge::If {
+                        true_case: Label::Point(14),
+                        false_case: Label::Point(16),
+                    },
+                ),
+                (Label::Point(14), OutgoingEdge::Pass { next: Label::Exit }),
+                (
+                    Label::Point(16),
+                    OutgoingEdge::WhileFalse {
+                        body_start: Label::Point(29),
+                        after: Label::Point(34),
+                    },
+                ),
+                (
+                    Label::Point(29),
+                    OutgoingEdge::LoopBack {
+                        header: Label::Point(16),
+                    },
+                ),
+                (Label::Point(34), OutgoingEdge::Pass { next: Label::Exit }),
             ],
         );
         assert_eq!(cfg, expected);
@@ -460,7 +611,7 @@ mod tests {
             Bytecode::MoveLoc(1),
             Bytecode::Ret,
         ];
-        let cfg = Cfg::new(&bytecode);
+        let cfg = Cfg::new(&bytecode).unwrap();
         let expected = build_expected_cfg(
             [
                 (Label::Entry, &bytecode[0..2]),
@@ -473,32 +624,60 @@ mod tests {
                 (Label::Exit, &[]),
             ],
             [
-                (Label::Entry, [Label::Point(2)].as_slice()),
-                (Label::Point(2), &[Label::Point(7), Label::Point(29)]),
-                (Label::Point(7), &[Label::Point(13), Label::Point(18)]),
-                (Label::Point(13), &[Label::Point(24)]),
-                (Label::Point(18), &[Label::Point(24)]),
-                (Label::Point(24), &[Label::Point(2)]),
-                (Label::Point(29), &[Label::Exit]),
+                (
+                    Label::Entry,
+                    OutgoingEdge::Pass {
+                        next: Label::Point(2),
+                    },
+                ),
+                (
+                    Label::Point(2),
+                    OutgoingEdge::WhileTrue {
+                        body_start: Label::Point(7),
+                        after: Label::Point(29),
+                    },
+                ),
+                (
+                    Label::Point(7),
+                    OutgoingEdge::If {
+                        true_case: Label::Point(13),
+                        false_case: Label::Point(18),
+                    },
+                ),
+                (
+                    Label::Point(13),
+                    OutgoingEdge::Pass {
+                        next: Label::Point(24),
+                    },
+                ),
+                (
+                    Label::Point(18),
+                    OutgoingEdge::Pass {
+                        next: Label::Point(24),
+                    },
+                ),
+                (
+                    Label::Point(24),
+                    OutgoingEdge::LoopBack {
+                        header: Label::Point(2),
+                    },
+                ),
+                (Label::Point(29), OutgoingEdge::Pass { next: Label::Exit }),
             ],
         );
         assert_eq!(cfg, expected);
     }
 
-    fn build_expected_cfg<'a, 'b, B, E, T>(blocks: B, edges: E) -> Cfg<'a>
+    fn build_expected_cfg<'a, B, E>(blocks: B, edges: E) -> Cfg<'a>
     where
         B: IntoIterator<Item = (Label, &'a [Bytecode])>,
-        E: IntoIterator<Item = (Label, T)>,
-        T: IntoIterator<Item = &'b Label>,
+        E: IntoIterator<Item = (Label, OutgoingEdge)>,
     {
         let expected_blocks = blocks
             .into_iter()
             .map(|(l, code)| (l, Block::new(code)))
             .collect();
-        let expected_edges = edges
-            .into_iter()
-            .map(|(l, ls)| (l, ls.into_iter().copied().collect()))
-            .collect();
+        let expected_edges = edges.into_iter().collect();
         Cfg {
             blocks: expected_blocks,
             edges: expected_edges,

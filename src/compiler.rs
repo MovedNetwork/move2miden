@@ -81,7 +81,7 @@ fn compile_function(
         None => return empty_proc(function.name.clone()),
     };
     let _locals = &function.locals;
-    let _cfg = Cfg::new(&code.code); // TODO: use cfg to handle control flow
+    let _cfg = Cfg::new(&code.code)?; // TODO: use cfg to handle control flow
     let nodes = compile_body(&code.code, state)?;
     let body = CodeBody::new(nodes);
     let result = ProcedureAst {
