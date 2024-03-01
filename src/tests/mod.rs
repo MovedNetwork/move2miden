@@ -25,11 +25,7 @@ fn test_compile_arithmetic() {
     )
     .unwrap();
     let outputs = result.stack_outputs().stack();
-    // Outputs are 1s for each assertion.
-    assert_eq!(
-        outputs,
-        &[1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-    );
+    assert_eq!(outputs, &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 }
 
 #[test]

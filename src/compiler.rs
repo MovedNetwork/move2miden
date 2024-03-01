@@ -1,5 +1,5 @@
 use {
-    crate::cfg::Cfg,
+    crate::cfg::{Cfg, Label, OutgoingEdge},
     anyhow::Error,
     miden_assembly::{
         ast::{CodeBody, Instruction, Node, ProcedureAst, ProgramAst, SourceLocation},
@@ -81,9 +81,8 @@ fn compile_function(
         None => return empty_proc(function.name.clone()),
     };
     let _locals = &function.locals;
-    let _cfg = Cfg::new(&code.code)?; // TODO: use cfg to handle control flow
-    let nodes = compile_body(&code.code, state)?;
-    let body = CodeBody::new(nodes);
+    let cfg = Cfg::new(&code.code)?;
+    let body = compile_with_cfg(&cfg, state, Label::Entry, Label::Exit)?;
     let result = ProcedureAst {
         name: function.name.as_str().try_into().map_err(Error::msg)?,
         docs: None,
@@ -95,8 +94,65 @@ fn compile_function(
     Ok(result)
 }
 
-fn compile_body(bytecode: &[Bytecode], state: &CompilerState) -> anyhow::Result<Vec<Node>> {
-    let mut result = Vec::new();
+// TODO: rewrite without recursion
+fn compile_with_cfg(
+    cfg: &Cfg<'_>,
+    state: &CompilerState,
+    current_label: Label,
+    target_label: Label,
+) -> anyhow::Result<CodeBody> {
+    let mut nodes = Vec::new();
+    if current_label == target_label {
+        return Ok(CodeBody::new(nodes));
+    }
+    let body = cfg.block(&current_label)?;
+    compile_body(body, state, &mut nodes)?;
+    match cfg.edge(&current_label)? {
+        OutgoingEdge::Pass { next } => {
+            let next = compile_with_cfg(cfg, state, *next, target_label)?;
+            nodes.extend_from_slice(next.nodes());
+        }
+        OutgoingEdge::If {
+            true_case,
+            false_case,
+        } => {
+            let new_target = crate::cfg::first_common_ancestor(cfg.edges(), true_case, false_case);
+            let true_case = compile_with_cfg(cfg, state, *true_case, new_target)?;
+            let false_case = compile_with_cfg(cfg, state, *false_case, new_target)?;
+            nodes.push(Node::IfElse {
+                true_case,
+                false_case,
+            });
+        }
+        OutgoingEdge::LoopBack { header } => {
+            let body = cfg.block(header)?;
+            compile_body(body, state, &mut nodes)?;
+            if let OutgoingEdge::WhileFalse { .. } = cfg.edge(header)? {
+                nodes.push(Node::Instruction(Instruction::Not));
+            }
+        }
+        OutgoingEdge::WhileTrue { body_start, after } => {
+            let body = compile_with_cfg(cfg, state, *body_start, target_label)?;
+            nodes.push(Node::While { body });
+            let remainder = compile_with_cfg(cfg, state, *after, target_label)?;
+            nodes.extend_from_slice(remainder.nodes());
+        }
+        OutgoingEdge::WhileFalse { body_start, after } => {
+            nodes.push(Node::Instruction(Instruction::Not));
+            let body = compile_with_cfg(cfg, state, *body_start, target_label)?;
+            nodes.push(Node::While { body });
+            let remainder = compile_with_cfg(cfg, state, *after, target_label)?;
+            nodes.extend_from_slice(remainder.nodes());
+        }
+    };
+    Ok(CodeBody::new(nodes))
+}
+
+fn compile_body(
+    bytecode: &[Bytecode],
+    state: &CompilerState,
+    result: &mut Vec<Node>,
+) -> anyhow::Result<()> {
     for c in bytecode {
         let node = match c {
             Bytecode::Add => Node::Instruction(Instruction::Add),
@@ -118,9 +174,13 @@ fn compile_body(bytecode: &[Bytecode], state: &CompilerState) -> anyhow::Result<
             Bytecode::Pop => Node::Instruction(Instruction::Drop), // TODO: type validation
             Bytecode::MoveLoc(_) => continue,                      // TODO: properly handle locals
             Bytecode::Ret => continue, // TODO: properly handle function return
-            Bytecode::Abort => Node::Instruction(Instruction::Drop), // TODO: type validation, stack emptiness
-            Bytecode::BrFalse(_) => continue, // TODO: properly handle control flow
-            Bytecode::Branch(_) => continue,  // TODO: properly handle control flow
+            Bytecode::Abort => {
+                // TODO: figure out how to use error code
+                result.push(Node::Instruction(Instruction::Drop));
+                result.push(Node::Instruction(Instruction::PushU32(1)));
+                result.push(Node::Instruction(Instruction::Assertz));
+                continue;
+            }
             Bytecode::Call(index) => {
                 let _name = &state
                     .functions
@@ -130,12 +190,15 @@ fn compile_body(bytecode: &[Bytecode], state: &CompilerState) -> anyhow::Result<
                 // TODO: use the name to figure out what to call.
                 Node::Instruction(Instruction::ExecLocal(index.0))
             }
+            Bytecode::BrFalse(_) | Bytecode::BrTrue(_) | Bytecode::Branch(_) => {
+                unreachable!("Control flow handled by CFG");
+            }
             // TODO: other bytecodes
             _ => anyhow::bail!("Unimplemented opcode {c:?}"),
         };
         result.push(node);
     }
-    Ok(result)
+    Ok(())
 }
 
 fn empty_proc(name: String) -> anyhow::Result<ProcedureAst> {

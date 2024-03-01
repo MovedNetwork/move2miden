@@ -1,8 +1,8 @@
 //! Module for creating control flow graphs for Move functions.
 
 use std::{
-    cmp::Ordering,
-    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
+    cmp::{self, Ordering},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque},
     fmt, iter,
 };
 
@@ -87,6 +87,22 @@ pub enum OutgoingEdge {
     // We will convert to `WhileTrue` by adding an extra `Not` instruction
     // during the compilation step.
     WhileFalse { body_start: Label, after: Label },
+}
+
+impl OutgoingEdge {
+    fn iter(&self) -> impl Iterator<Item = &Label> {
+        let elems = match self {
+            OutgoingEdge::If {
+                true_case,
+                false_case,
+            } => [Some(true_case), Some(false_case)],
+            OutgoingEdge::Pass { next } => [Some(next), None],
+            OutgoingEdge::LoopBack { header } => [Some(header), None],
+            OutgoingEdge::WhileTrue { body_start, after } => [Some(body_start), Some(after)],
+            OutgoingEdge::WhileFalse { body_start, after } => [Some(body_start), Some(after)],
+        };
+        elems.into_iter().flatten()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -253,6 +269,24 @@ impl<'a> Cfg<'a> {
 
         Ok(Self { blocks, edges })
     }
+
+    pub fn edges(&self) -> &BTreeMap<Label, OutgoingEdge> {
+        &self.edges
+    }
+
+    pub fn block(&self, label: &Label) -> anyhow::Result<&'a [Bytecode]> {
+        Ok(self
+            .blocks
+            .get(label)
+            .ok_or_else(|| anyhow::Error::msg("CFG block not found"))?
+            .code)
+    }
+
+    pub fn edge(&self, label: &Label) -> anyhow::Result<&OutgoingEdge> {
+        self.edges
+            .get(label)
+            .ok_or_else(|| anyhow::Error::msg("CFG edge not found"))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,8 +301,6 @@ pub enum CfgError {
     SelfBranch,
     // It is not allowed to have multiple BrTrue/BrFalse in a row.
     RepeatConditionalBranch,
-    // This error is returned if we try to set and edge when not in a block
-    UnexpectedBlockEnd,
     // Loop headers are expected to have two branch options: loop body or post-loop code
     InvalidLoopHeader,
 }
@@ -326,48 +358,71 @@ fn has_path(edges: &BTreeMap<Label, OutgoingEdge>, start: &Label, target: &Label
         if label == target {
             return true;
         }
-        match edges.get(label) {
-            Some(OutgoingEdge::If {
-                true_case,
-                false_case,
-            }) => {
-                if !visited.contains(true_case) {
-                    queue.push_back(true_case);
-                }
-                if !visited.contains(false_case) {
-                    queue.push_back(false_case);
+        if let Some(edge) = edges.get(label) {
+            for l in edge.iter() {
+                if !visited.contains(l) {
+                    queue.push_back(l);
                 }
             }
-            Some(OutgoingEdge::LoopBack { header }) => {
-                if !visited.contains(header) {
-                    queue.push_back(header);
-                }
-            }
-            Some(OutgoingEdge::Pass { next }) => {
-                if !visited.contains(next) {
-                    queue.push_back(next);
-                }
-            }
-            Some(OutgoingEdge::WhileTrue { body_start, after }) => {
-                if !visited.contains(body_start) {
-                    queue.push_back(body_start);
-                }
-                if !visited.contains(after) {
-                    queue.push_back(after);
-                }
-            }
-            Some(OutgoingEdge::WhileFalse { body_start, after }) => {
-                if !visited.contains(body_start) {
-                    queue.push_back(body_start);
-                }
-                if !visited.contains(after) {
-                    queue.push_back(after);
-                }
-            }
-            None => (),
         }
     }
     false
+}
+
+// Finds the first label which is reachable from both `x` and `y` using `edges`.
+pub fn first_common_ancestor(edges: &BTreeMap<Label, OutgoingEdge>, x: &Label, y: &Label) -> Label {
+    let mut x_visited = BTreeSet::new();
+    let mut y_visited = BTreeSet::new();
+    let mut queue = BinaryHeap::new();
+
+    queue.push(FCAQueueElem::new(x, x));
+    queue.push(FCAQueueElem::new(y, y));
+
+    while let Some(elem) = queue.pop() {
+        let origin = elem.origin();
+        let label = elem.label();
+
+        let (origin_visited, other_visited) = if origin == x {
+            (&mut x_visited, &y_visited)
+        } else {
+            (&mut y_visited, &x_visited)
+        };
+
+        origin_visited.insert(label);
+        if other_visited.contains(label) {
+            return *label;
+        }
+
+        if let Some(edge) = edges.get(label) {
+            for l in edge.iter() {
+                // Ignore LoopBacks by enforcing l > origin
+                if !origin_visited.contains(l) && l > origin {
+                    queue.push(FCAQueueElem::new(l, origin));
+                }
+            }
+        }
+    }
+
+    // All nodes eventually reach the exit
+    Label::Exit
+}
+
+/// Helper struct in the `first_common_ancestor` algorithm
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FCAQueueElem<'a>(cmp::Reverse<&'a Label>, &'a Label);
+
+impl<'a> FCAQueueElem<'a> {
+    fn new(label: &'a Label, origin: &'a Label) -> Self {
+        Self(cmp::Reverse(label), origin)
+    }
+
+    fn label(&self) -> &'a Label {
+        self.0 .0
+    }
+
+    fn origin(&self) -> &'a Label {
+        self.1
+    }
 }
 
 #[cfg(test)]
@@ -574,6 +629,10 @@ mod tests {
             ],
         );
         assert_eq!(cfg, expected);
+        assert_eq!(
+            first_common_ancestor(&cfg.edges, &Label::Point(8), &Label::Point(10)),
+            Label::Exit
+        );
     }
 
     #[test]
@@ -666,6 +725,10 @@ mod tests {
             ],
         );
         assert_eq!(cfg, expected);
+        assert_eq!(
+            first_common_ancestor(&cfg.edges, &Label::Point(13), &Label::Point(18)),
+            Label::Point(24)
+        );
     }
 
     fn build_expected_cfg<'a, B, E>(blocks: B, edges: E) -> Cfg<'a>
