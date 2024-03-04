@@ -5,9 +5,9 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
-miden-assembly = "0.7"
+miden-assembly = "0.8"
 move-binary-format = { git = "https://github.com/aptos-labs/aptos-core/", tag = "aptos-node-v1.9.3" }
 
 [dev-dependencies]
 move-compiler = { git = "https://github.com/aptos-labs/aptos-core/", tag = "aptos-node-v1.9.3" }
-miden-vm = "0.7"
+miden-vm = "0.8"

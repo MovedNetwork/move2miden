@@ -158,8 +158,8 @@ fn compile_body(
             Bytecode::Add => Node::Instruction(Instruction::Add),
             Bytecode::Sub => Node::Instruction(Instruction::Sub),
             Bytecode::Mul => Node::Instruction(Instruction::Mul),
-            Bytecode::Div => Node::Instruction(Instruction::U32CheckedDiv),
-            Bytecode::Mod => Node::Instruction(Instruction::U32CheckedMod),
+            Bytecode::Div => Node::Instruction(Instruction::U32Div),
+            Bytecode::Mod => Node::Instruction(Instruction::U32Mod),
             Bytecode::LdU32(x) => Node::Instruction(Instruction::PushU32(*x)),
             Bytecode::LdU64(x) => {
                 let x = *x;
